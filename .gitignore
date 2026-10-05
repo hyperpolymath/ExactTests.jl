@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MPL-2.0
+# A library does not pin its consumers' resolution; each test project resolves fresh.
+Manifest.toml
+**/Manifest.toml
+# Agda interface files are build output.
+*.agdai
+_build/

@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: MPL-2.0
+name = "ExactTests"
+uuid = "3943c2f2-5cd6-433f-aa46-636087498ef7"
+authors = ["Jonathan D.A. Jewell <6759885+hyperpolymath@users.noreply.github.com>"]
+version = "0.1.0"
+
+[compat]
+julia = "1.10"
+
+[extras]
+TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["TOML", "Test"]

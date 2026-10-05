@@ -1,0 +1,5 @@
+-- SPDX-License-Identifier: MPL-2.0
+name: exacttests-proofs
+depend: standard-library-2.1
+include: .
+flags: --safe --without-K
