@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
+# SPDX-FileCopyrightText: 2026 Jonathan D.A. Jewell (hyperpolymath) <j.d.a.jewell@open.ac.uk>
+#
+# Prove that the proof gate can fail.
+#
+# A gate that has never been observed to reject anything is not evidence.  This
+# script takes a throwaway copy of the proof tree, breaks it in one specific way
+# at a time, and requires the gate to reject it.  If any mutation is *accepted*,
+# or if a mutation failed to apply at all, this script exits non-zero.
+#
+# Three kinds of control:
+#   1. planted defects in a theorem — the type-checker must reject them;
+#   2. planted defects in the tree's hygiene (a module dropped from the entry
+#      point, a postulate, `--safe` removed) — the axiom audit must reject them;
+#   3. the standing negative controls in `proofs/agda/reject/` — Agda must
+#      reject each one with the exact error its `-- EXPECT:` line names, so that
+#      a rejection for the wrong reason (a missing import, say) does not pass
+#      for the right one.
+# And finally the pristine tree must still be accepted, so that a gate which
+# rejects everything cannot pass this test either.
+#
+# It runs in CI.  A gate whose self-test is skipped is a gate nobody can trust,
+# so there is no flag to turn this off.
+#
+# Usage: proofs/tests/gate-selftest.sh
+#
+# Toolchain: Debian 13's Agda 2.6.4.3 and agda-stdlib 2.1, resolved by
+# proofs/lib.sh (nothing is vendored; an absent or wrong prover is a failure).
+
+# shellcheck disable=SC2016  # mutators are snippets run by an inner bash; their $1 is deliberately not expanded here
+set -uo pipefail
+
+# shellcheck source=proofs/lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
+NAMESPACE="ExactTests"
+LIB_BASENAME="exacttests-proofs.agda-lib"
+
+resolve_agda
+resolve_stdlib
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+# Replace the working copy with a fresh copy of the pristine proof tree and
+# the test scripts.  Interface files (`_build/`, `*.agdai`) are removed from
+# the copy so that nothing checked against the pristine sources can be reused
+# for a mutated one.
+reset_tree() {
+  rm -rf "$WORK/agda" "$WORK/tests"
+  cp -r "$PROOFS_DIR/agda" "$WORK/agda"
+  cp -r "$PROOFS_DIR/tests" "$WORK/tests"
+  rm -rf "$WORK/agda/_build"
+  find "$WORK/agda" -name '*.agdai' -delete
+  [[ -f "$WORK/agda/$LIB_BASENAME" ]] || die "missing $PROOFS_DIR/agda/$LIB_BASENAME"
+}
+
+reset_tree
+
+# Point Agda at the *copy*: without this the library file would resolve
+# `ExactTests.All` back to the pristine tree and every mutation below would
+# be checked against unmutated sources — a self-test that tests nothing.
+write_libraries "$WORK/libraries" "$WORK/agda"
+
+# Type-check the copy's entry module with the gate's exact flags.  Output goes
+# to $WORK/out.txt; the exit status is the verdict.
+run_gate() {
+  ( cd "$WORK/agda" && "$AGDA" --library-file="$WORK/libraries" --safe --without-K "$NAMESPACE/All.agda" ) \
+    >"$WORK/out.txt" 2>&1
+}
+
+# Run the copied axiom audit, which resolves its own tree from its location
+# and so audits the copy.
+run_audit() { "$WORK/tests/axiom-audit.sh" >"$WORK/out.txt" 2>&1; }
+
+total=0
+failed=0
+
+# expect_reject <name> <runner> <file> <mutation-script> [reason-regex]
+#
+# Restore <file> (relative to proofs/agda) in the copy, apply the mutation
+# (a shell snippet receiving the file as $1), and require <runner> to fail.
+# Counts a FAIL if the mutation did not change the file (a stale pattern
+# would otherwise pass silently as "rejected") or if the runner accepted the
+# mutated tree.  With a [reason-regex], the runner must also fail WITH that
+# finding: a rejection for some other reason is a FAIL.  Restores the file
+# afterwards.
+expect_reject() {
+  local name="$1" runner="$2" target="$3" mutator="$4" reason="${5:-}"
+  local file="$WORK/agda/$target"
+  total=$((total + 1))
+
+  cp "$PROOFS_DIR/agda/$target" "$file"
+  local before after
+  before="$(sha256sum "$file" | awk '{print $1}')"
+  bash -c "$mutator" mutator "$file"
+  after="$(sha256sum "$file" | awk '{print $1}')"
+  if [[ "$before" == "$after" ]]; then
+    printf 'gate-selftest: FAIL  %-48s mutation did not apply (stale pattern?)\n' "$name"
+    failed=$((failed + 1))
+    cp "$PROOFS_DIR/agda/$target" "$file"
+    return
+  fi
+
+  if $runner; then
+    printf 'gate-selftest: FAIL  %-48s gate ACCEPTED a broken proof\n' "$name"
+    sed 's/^/                     | /' "$WORK/out.txt" | head -6
+    failed=$((failed + 1))
+  elif [[ -n "$reason" ]] && ! grep -qE -- "$reason" "$WORK/out.txt"; then
+    printf 'gate-selftest: FAIL  %-48s rejected, but not for the expected reason\n' "$name"
+    printf '                     | expected /%s/\n' "$reason"
+    sed 's/^/                     | /' "$WORK/out.txt" | head -6
+    failed=$((failed + 1))
+  else
+    printf 'gate-selftest: ok    %-48s rejected\n' "$name"
+  fi
+  cp "$PROOFS_DIR/agda/$target" "$file"
+}
+
+# expect_reject_for_reason <file>
+#
+# Type-check one standing negative control from proofs/agda/reject/ and
+# require BOTH that Agda exits 42 (a type error, as opposed to 1 for a
+# missing file or library) AND that its output matches the extended regex on
+# the control's `-- EXPECT:` line.  A control with no EXPECT line is a FAIL:
+# an unexplained rejection is not a control.
+expect_reject_for_reason() {
+  local target="$1" name file pattern rc
+  name="reject/$(basename "${target%.agda}")"
+  file="$WORK/agda/$target"
+  total=$((total + 1))
+
+  pattern="$(sed -nE 's/^-- EXPECT: (.*)$/\1/p' "$file" | head -1)"
+  if [[ -z "$pattern" ]]; then
+    printf 'gate-selftest: FAIL  %-48s has no -- EXPECT: line\n' "$name"
+    failed=$((failed + 1))
+    return
+  fi
+
+  ( cd "$WORK/agda" && "$AGDA" --library-file="$WORK/libraries" --safe --without-K "$target" ) \
+    >"$WORK/out.txt" 2>&1
+  rc=$?
+  if [[ $rc -eq 0 ]]; then
+    printf 'gate-selftest: FAIL  %-48s gate ACCEPTED a negative control\n' "$name"
+    failed=$((failed + 1))
+  elif [[ $rc -ne 42 ]]; then
+    printf 'gate-selftest: FAIL  %-48s exited %d, not 42 (not a type error)\n' "$name" "$rc"
+    sed 's/^/                     | /' "$WORK/out.txt" | head -6
+    failed=$((failed + 1))
+  elif ! grep -qE -- "$pattern" "$WORK/out.txt"; then
+    printf 'gate-selftest: FAIL  %-48s rejected, but not for the expected reason\n' "$name"
+    printf '                     | expected /%s/\n' "$pattern"
+    sed 's/^/                     | /' "$WORK/out.txt" | grep -v '^ *| *Checking' | head -6
+    failed=$((failed + 1))
+  else
+    printf 'gate-selftest: ok    %-48s rejected for the expected reason\n' "$name"
+  fi
+}
+
+# --- the type-checker must reject wrong mathematics -------------------------
+#
+# Each mutator is a shell snippet receiving the target file as $1.  If a snippet
+# stops matching (because the proof was rewritten), `expect_reject` reports the
+# mutation as unapplied rather than silently passing.
+
+expect_reject "sums: first summand dropped from sumTo" run_gate "$NAMESPACE/Sums.agda" \
+  'sed -i "s|^sumTo (suc k) f = f 0 + sumTo k (f ∘ suc)|sumTo (suc k) f = sumTo k (f ∘ suc)|" "$1"'
+
+expect_reject "sums: tail selection inverted" run_gate "$NAMESPACE/Sums.agda" \
+  'sed -i "s|^sel keep f k = sumTo k (λ a → if keep a then f a else 0)|sel keep f k = sumTo k (λ a → if keep a then 0 else f a)|" "$1"'
+
+expect_reject "binomial: C(0, k+1) set to 1" run_gate "$NAMESPACE/Binomial.agda" \
+  'sed -i "s|^C zero    (suc k) = 0|C zero    (suc k) = 1|" "$1"'
+
+expect_reject "binomial: one parent dropped from Pascal's rule" run_gate "$NAMESPACE/Binomial.agda" \
+  'sed -i "s|^C (suc n) (suc k) = C n k + C n (suc k)|C (suc n) (suc k) = C n k|" "$1"'
+
+expect_reject "hypergeometric: cell (2,1) ignores cell (1,1)" run_gate "$NAMESPACE/Hypergeometric.agda" \
+  'sed -i "s|^weight m n k a = C m a \* C n (k ∸ a)|weight m n k a = C m a * C n k|" "$1"'
+
+expect_reject "fisher: two-sided rule reversed" run_gate "$NAMESPACE/FisherExact.agda" \
+  'sed -i "s|^keepTwo d e m n k x a = weight m n k a \* d ≤ᵇ weight m n k x \* (d + e)|keepTwo d e m n k x a = weight m n k x * (d + e) ≤ᵇ weight m n k a * d|" "$1"'
+
+expect_reject "fisher: p ≤ 1 claimed as p ≥ 1" run_gate "$NAMESPACE/FisherExact.agda" \
+  'sed -i "s|^p-≤-1 : ∀ alt m n k x → tail alt m n k x ≤ total m n k|p-≤-1 : ∀ alt m n k x → total m n k ≤ tail alt m n k x|" "$1"'
+
+expect_reject "fisher: tolerance monotonicity reversed" run_gate "$NAMESPACE/FisherExact.agda" \
+  'sed -i "s|^  sel (keepTwo d e m n k x) (weight m n k) k ≤ sel (keepTwo d e′ m n k x) (weight m n k) k|  sel (keepTwo d e′ m n k x) (weight m n k) k ≤ sel (keepTwo d e m n k x) (weight m n k) k|" "$1"'
+
+# --- the axiom audit must reject an unchecked or unsound module -------------
+
+expect_reject "audit: module dropped from the gate entry" run_audit "$NAMESPACE/All.agda" \
+  'sed -i "/import ExactTests.FisherExact/d" "$1"' 'not reachable'
+
+expect_reject "audit: postulate injected" run_audit "$NAMESPACE/FisherExact.agda" \
+  'printf "postulate cheat : ∀ {A : Set} → A\n" >> "$1"' 'postulate block'
+
+expect_reject "audit: --safe removed" run_audit "$NAMESPACE/Sums.agda" \
+  'sed -i "s|--without-K --safe|--without-K|" "$1"' 'does not declare --safe'
+
+expect_reject "audit: FFI pragma injected" run_audit "$NAMESPACE/Sums.agda" \
+  'printf "\n{-# FOREIGN GHC import Data.List #-}\n" >> "$1"' 'FOREIGN/COMPILE/BUILTIN'
+
+expect_reject "audit: unsound flag added" run_audit "$NAMESPACE/Sums.agda" \
+  'sed -i "s|--safe|--safe --type-in-type|" "$1"' 'unsound flag'
+
+expect_reject "audit: trustMe mentioned" run_audit "$NAMESPACE/Sums.agda" \
+  'printf "\n-- uses trustMe\n" >> "$1"' 'trustMe/primTrust'
+
+expect_reject "audit: hole left in a module" run_audit "$NAMESPACE/Sums.agda" \
+  'printf "\nhole = {! !}\n" >> "$1"' 'contains a hole'
+
+# --- the standing negative controls must fail for their stated reason ------
+
+while IFS= read -r control; do
+  expect_reject_for_reason "reject/$(basename "$control")"
+done < <(find "$PROOFS_DIR/agda/reject" -maxdepth 1 -name '*.agda' -type f | sort)
+
+# --- the gate must still accept the pristine tree --------------------------
+
+total=$((total + 1))
+reset_tree
+if run_gate && run_audit; then
+  printf 'gate-selftest: ok    %-48s accepted\n' "pristine tree"
+else
+  printf 'gate-selftest: FAIL  %-48s gate REJECTED the real proofs\n' "pristine tree"
+  sed 's/^/                     | /' "$WORK/out.txt" | head -12
+  failed=$((failed + 1))
+fi
+
+printf 'gate-selftest: %d/%d controls behaved correctly\n' "$((total - failed))" "$total"
+[[ $failed -eq 0 ]] || exit 1
